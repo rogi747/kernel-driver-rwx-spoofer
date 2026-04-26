@@ -1,79 +1,82 @@
-# calamari
+# kernel-driver
 
-Kernel-mode driver for cross-process memory operations and hardware identity spoofing on Windows 10/11 x64. Designed to be loaded via KDMapper (or any manual mapper that passes a usermode buffer as `DriverObject`).
+Windows x64 kernel driver for cross-process memory I/O and hardware identity spoofing. Loaded via KDMapper — communicates with usermode through a shared memory buffer mapped with MDL.
 
-## Features
+> Built for Windows 10/11 x64 · VS2022 v143 · WDK 10.0.26100.0
 
-- **Shared-memory command interface** — 52-byte packed buffer, MDL-mapped from usermode, polled in a spin loop with heartbeat monitoring
-- **Cross-process R/W** — `MmCopyVirtualMemory`-based reads and writes with intermediate kernel buffering (stack for ≤4KB, pool for larger)
-- **Process image base resolution** — three fallback methods: `PsGetProcessSectionBaseAddress` → `PEB->ImageBaseAddress` → `PEB->Ldr->InLoadOrderModuleList`
-- **HWID spoofing** — seed-based XOR hooks on disk serial (`IOCTL_STORAGE_QUERY_PROPERTY`), TPM EK/SRK (`TPM_SUBMIT_COMMAND`), and SMBIOS DMI strings (types 1/2/3/17)
-- **Atomic hook installation** — `InterlockedExchange64` on driver `MajorFunction` tables, re-entrant safe via thread-ID checks
-- **BSOD hardened** — SEH wrapping on every user-facing path, process liveness checks before every memory operation
+---
 
-## Building
+## What it does
 
-You need Visual Studio 2022 with the v143 toolset and WDK 10.0.26100.0 installed.
+**Memory** — read and write arbitrary process memory from kernel via `MmCopyVirtualMemory`. Uses a stack buffer for small copies (≤4KB) and pooled allocation for larger ones. Three fallback methods for resolving a process's image base.
+
+**HWID Spoofing** — installs dispatch hooks on `disk.sys`, `tpm.sys`, and `mssmbios.sys` using atomic `InterlockedExchange64` on `MajorFunction` tables. Intercepts storage/TPM/SMBIOS queries and XORs serial fields in the response with a 32-byte user-supplied seed.
+
+**Communication** — 52-byte packed struct shared between usermode and kernel. The loader writes a command, the driver picks it up in a spin loop, executes it, and writes back the result. Heartbeat counter lets the loader detect a stuck or dead driver.
+
+---
+
+## Opcodes
+
+| # | Name | Description |
+|---|------|-------------|
+| 1 | `GET_BASE` | Attach to PID, return image base |
+| 2 | `READ_MEMORY` | Copy from target process → loader |
+| 3 | `PROBE_BYTE` | Ping (writes `1` to buffer) |
+| 6 | `WRITE_MEMORY` | Copy from loader → target process |
+| 7 | `PROBE_QWORD` | Ping (writes `1` as QWORD) |
+| 9 | `GET_PEB` | Return target PEB address |
+| 14 | `SPOOF_INIT` | Install HWID hooks with XOR seed |
+| 15 | `SPOOF_CLEANUP` | Remove hooks, restore originals |
+
+---
+
+## Spoof targets
+
+| Driver | IOCTL / IRP | What gets XOR'd |
+|--------|-------------|-----------------|
+| `disk.sys` | `STORAGE_QUERY_PROPERTY` | Serial number string (up to 20 bytes) |
+| `tpm.sys` | `TPM_SUBMIT_COMMAND` (codes 305, 334, 371) | EK/SRK regions at offsets 0x14 and 0x3C (32 bytes each) |
+| `mssmbios.sys` | `IRP_MJ_SYSTEM_CONTROL` | DMI strings for System (1), Baseboard (2), Chassis (3), Memory (17) |
+
+---
+
+## Project structure
+
+```
+├── driver.h               undocumented ntoskrnl imports, command struct, opcodes
+├── globals.h              all mutable state in one place
+├── driver_entry.cpp       DriverEntry + worker thread loop
+├── command_dispatch.cpp   opcode switch
+├── memory.cpp             MmCopyVirtualMemory wrappers + validation
+├── process.cpp            PID attach, driver object resolution, base address lookup
+├── spoof.cpp              hook install/teardown, XOR routines
+├── hooks.cpp              disk, TPM, SMBIOS IRP dispatch hooks
+└── util.cpp               debug logging
+```
+
+---
+
+## Build
 
 ```
 msbuild calamari_bo7.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-Output lands in `bin/Release/driver_bo7.sys`.
+Output: `bin/Release/driver_bo7.sys`
 
-## Command protocol
+---
 
-Loader allocates a `CALAMARI_CMD_BUF` struct, passes its VA as `DriverObject` to KDMapper. The driver MDL-maps it into kernel space and spins:
+## Implementation notes
 
-```
-State=1 (loader sets)  →  kernel reads, dispatches, writes result  →  State=2 (kernel sets)
-```
+- `DriverObject` param is reused as a shared buffer pointer — KDMapper doesn't provide a clean way to pass arguments, so this is the standard workaround
+- All user-facing code paths are wrapped in SEH to prevent BSODs from bad pointers or dying processes
+- Hook re-entrancy is handled by comparing `KeGetCurrentThread()` against a stored thread pointer — if the hook itself issues the forwarded IRP, it passes through to the original handler
+- SMBIOS hook copies IRP stack locations with raw `__m128i` moves instead of `IoCopyCurrentIrpStackLocationToNext` to match specific codegen layout
+- Worker thread monitors loader liveness via `PsGetProcessExitStatus` and tears down cleanly on loader exit
 
-Every 256 idle ticks the kernel writes its heartbeat counter to `Result` so the loader can detect a stuck driver.
-
-| Opcode | Name | What it does |
-|--------|------|-------------|
-| 1 | `GET_BASE` | Attaches to PID, returns image base |
-| 2 | `READ_MEMORY` | Copies `[src, src+size)` from target → loader VA |
-| 3 | `PROBE_BYTE` | Writes 1 to `Data[0]`, used as a ping |
-| 6 | `WRITE_MEMORY` | Copies `[src, src+size)` from loader → target VA |
-| 7 | `PROBE_QWORD` | Writes 1 as QWORD to `Data`, used as a ping |
-| 9 | `GET_PEB` | Returns target PEB address |
-| 14 | `SPOOF_INIT` | Seeds the XOR key and installs disk/TPM/SMBIOS hooks |
-| 15 | `SPOOF_CLEANUP` | Restores original dispatch functions, derefs driver objects |
-
-## Spoofing details
-
-All three hooks follow the same pattern: intercept the IRP, build a new one to forward downstream, wait for completion, XOR the relevant fields in the response buffer, then complete the original IRP with modified data.
-
-**Disk** — targets `STORAGE_DEVICE_DESCRIPTOR.SerialNumberOffset`, XORs up to 20 bytes of the serial string.
-
-**TPM** — targets response payloads for command codes 305 (TPM2_ReadPublic), 334 (TPM2_GetCapability), 371 (TPM2_CreatePrimary). XORs two 32-byte regions at offsets 0x14 and 0x3C.
-
-**SMBIOS** — hooks `IRP_MJ_SYSTEM_CONTROL` on `mssmbios.sys` with a completion routine. Walks the raw DMI table and XORs serial-number string fields for System Information (type 1), Baseboard (type 2), Chassis (type 3), and Memory Device (type 17). XOR'd bytes that fall outside printable ASCII are folded back into `[A-Z]`.
-
-## File layout
-
-```
-calamari_bo7/
-├── driver.h              — ntoskrnl imports, command struct, opcodes
-├── globals.h             — all mutable state
-├── driver_entry.cpp      — DriverEntry + worker thread
-├── command_dispatch.cpp  — opcode switch
-├── memory.cpp            — MmCopyVirtualMemory wrappers
-├── process.cpp           — PID attach, base address resolution
-├── spoof.cpp             — hook install/teardown, XOR logic
-├── hooks.cpp             — IRP dispatch hooks (disk, TPM, SMBIOS)
-└── util.cpp              — DbgLog, SafeVsnprintf
-```
-
-## Notes
-
-- The driver abuses `DriverObject` as a buffer pointer because KDMapper doesn't provide a clean param-passing mechanism. This is intentional.
-- `g_VestigialQword` exists solely to preserve the `.data` section layout from the original binary. It's zeroed on init and never read.
-- The SMBIOS hook copies stack locations with SSE moves (`__m128i`) instead of `IoCopyCurrentIrpStackLocationToNext` to match specific codegen requirements.
-- Worker thread teardown is graceful: it detects loader death via `PsGetProcessExitStatus` polling and cleans up all references before exiting.
+---
 
 ## License
 
-MIT
+[MIT](LICENSE)
