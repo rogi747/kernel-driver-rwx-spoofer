@@ -1,0 +1,20 @@
+# Build outputs
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.ipch
+
+# JetBrains
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
